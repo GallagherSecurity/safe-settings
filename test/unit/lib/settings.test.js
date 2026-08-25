@@ -305,6 +305,89 @@ repository:
     })
   }) // loadConfigs
 
+  describe('updateRepos', () => {
+    let settings
+
+    beforeEach(() => {
+      mockSubOrg = undefined
+      stubConfig = {
+        restrictedRepos: {},
+        repository: { topics: ['frontend'] }
+      }
+      settings = createSettings(stubConfig)
+      settings.subOrgConfigs = {}
+      settings.repoConfigs = {}
+      jest.spyOn(settings, 'childPluginsList').mockReturnValue([])
+    })
+
+    it('skips RepoPlugin and child plugin sync for a repo that is already archived', async () => {
+      settings.github.rest.repos.get = jest.fn().mockResolvedValue({ data: { archived: true } })
+      const RepoPlugin = Settings.PLUGINS.repository
+      const syncSpy = jest.spyOn(RepoPlugin.prototype, 'sync').mockResolvedValue([])
+
+      await settings.updateRepos(mockRepo)
+
+      expect(syncSpy).not.toHaveBeenCalled()
+      syncSpy.mockRestore()
+    })
+
+    it('unarchives then runs plugin sync when the repo should be unarchived', async () => {
+      stubConfig.repository = { topics: ['frontend'], archived: false }
+      settings = createSettings(stubConfig)
+      settings.subOrgConfigs = {}
+      settings.repoConfigs = {}
+      jest.spyOn(settings, 'childPluginsList').mockReturnValue([])
+
+      settings.github.rest.repos.get = jest.fn().mockResolvedValue({ data: { archived: true } })
+      settings.github.rest.repos.update = jest.fn().mockResolvedValue({ data: { archived: false } })
+      const RepoPlugin = Settings.PLUGINS.repository
+      const syncSpy = jest.spyOn(RepoPlugin.prototype, 'sync').mockResolvedValue([])
+
+      await settings.updateRepos(mockRepo)
+
+      expect(settings.github.rest.repos.update).toHaveBeenCalledWith(
+        expect.objectContaining({ archived: false })
+      )
+      expect(syncSpy).toHaveBeenCalled()
+      syncSpy.mockRestore()
+    })
+
+    it('runs RepoPlugin and child plugin sync for a repo that is not archived', async () => {
+      settings.github.rest.repos.get = jest.fn().mockResolvedValue({ data: { archived: false } })
+      const RepoPlugin = Settings.PLUGINS.repository
+      const syncSpy = jest.spyOn(RepoPlugin.prototype, 'sync').mockResolvedValue([])
+
+      await settings.updateRepos(mockRepo)
+
+      expect(syncSpy).toHaveBeenCalled()
+      syncSpy.mockRestore()
+    })
+
+    it('appends an ERROR NopCommand and does not throw when the archive check fails in nop mode', async () => {
+      settings.nop = true
+      settings.github.rest.repos.get = jest.fn().mockRejectedValue(new Error('boom'))
+      const RepoPlugin = Settings.PLUGINS.repository
+      const syncSpy = jest.spyOn(RepoPlugin.prototype, 'sync').mockResolvedValue([])
+      jest.spyOn(settings, 'appendToResults')
+
+      await expect(settings.updateRepos(mockRepo)).resolves.toBeUndefined()
+
+      expect(settings.appendToResults).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'ERROR' })
+        ])
+      )
+      expect(syncSpy).not.toHaveBeenCalled()
+      syncSpy.mockRestore()
+    })
+
+    it('rethrows when the archive check fails outside of nop mode', async () => {
+      settings.github.rest.repos.get = jest.fn().mockRejectedValue(new Error('boom'))
+
+      await expect(settings.updateRepos(mockRepo)).rejects.toThrow('boom')
+    })
+  }) // updateRepos
+
   describe('loadYaml', () => {
     let settings;
 
