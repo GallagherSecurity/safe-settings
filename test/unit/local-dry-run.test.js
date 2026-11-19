@@ -461,7 +461,8 @@ describe('run', () => {
 
       const text = formatReport(report)
       expect(text).toContain('leaving with this PR: repo-none (no suborg)')
-      expect(text).toContain('Repos leaving a changed suborg: repo-none')
+      expect(text).toContain('Repos not covered by this PR: repo-none (leaving a changed suborg)')
+      expect(report.nextSyncRepos).toEqual([{ repo: 'repo-none', reason: 'leaving' }])
       expect(text).toContain('These changes apply the next time it')
     })
 
@@ -503,6 +504,15 @@ describe('run', () => {
         expect.stringMatching(/^Couldn't work out which repos leave the changed suborgs: suborg membership at the head commit couldn't be resolved: .*Bad Gateway/)
       ])
       expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-a2'])
+    })
+
+    it('labels an error about the whole run as the run\'s, not a repo\'s', async () => {
+      // The changed repo file makes the run point settings.repo at repo-b before the error
+      const prFiles = ['.github/repos/repo-b.yml', '.github/suborgs/suborg-a.yml']
+      const { report } = await dryRun([], { prFiles, suborgs, failOnce: ['/orgs/my-org/properties/values'] })
+
+      expect(report.errors).toEqual([expect.objectContaining({ plugin: 'dry run', repo: null })])
+      expect(formatReport(report)).toContain('  dry run: Couldn\'t work out which repos leave')
     })
 
     it('reports none when the members are unchanged', async () => {
@@ -631,6 +641,32 @@ describe('run', () => {
     expect(formatReport(report)).toContain('suborgrepos entries that match no repo: typo-repo')
   })
 
+  describe('--repos on a PR that changes repo or suborg files', () => {
+    const suborgs = SUBORGS_WITHOUT_GLOB
+    const prFiles = ['.github/suborgs/suborg-a.yml']
+
+    it('adds the listed repos to those the PR covers', async () => {
+      const { report } = await dryRun(['--repos', 'repo-a1,repo-b'], { prFiles, suborgs })
+
+      expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-a2', 'repo-b'])
+    })
+
+    it('marks listed repos the PR does not cover as changes at their next sync', async () => {
+      const { report } = await dryRun(['--repos', 'repo-a1,repo-b'], { prFiles, suborgs })
+
+      expect(report.nextSyncRepos).toEqual([{ repo: 'repo-b', reason: 'listed' }])
+      expect(report.results.filter(r => r.repo === 'repo-b').every(r => r.deferred)).toBe(true)
+      expect(report.results.filter(r => r.repo === 'repo-a1').some(r => r.deferred)).toBe(false)
+      expect(formatReport(report)).toContain('Repos not covered by this PR: repo-b (from --repos)')
+    })
+
+    it('skips archived listed repos', async () => {
+      const { report } = await dryRun(['--repos', 'repo-archived'], { prFiles: ['.github/suborgs/suborg-b.yml'], suborgs })
+
+      expect(report.nextSyncRepos).toEqual([])
+    })
+  })
+
   it('rejects --repos that are not in the org, rather than reporting no changes', async () => {
     await expect(dryRun(['--repos', 'repo-a1,repo-typo'], { prFiles: ['.github/suborgs/suborg-a.yml'] }))
       .rejects.toThrow('--repos: not found in my-org: repo-typo')
@@ -706,10 +742,10 @@ describe('run', () => {
       expect(evaluatedRepos(report)).toContain('repo-c1')
     })
 
-    it('evaluates assumed repos even when --repos does not list them', async () => {
-      const { report } = await dryRun(['--repos', 'repo-a1', '--assume-suborg', 'suborg-a', '--assume-repos', 'repo-c1'], { prFiles: ['.github/suborgs/suborg-a.yml'] })
+    it('evaluates assumed repos alongside --repos', async () => {
+      const { report } = await dryRun(['--repos', 'repo-b', '--assume-suborg', 'suborg-a', '--assume-repos', 'repo-c1'], { prFiles: ['.github/suborgs/suborg-a.yml'], suborgs: SUBORGS_WITHOUT_GLOB })
 
-      expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-c1'])
+      expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-a2', 'repo-b', 'repo-c1'])
     })
 
     it('still evaluates org-level settings when a full sync stops on a conflict', async () => {
@@ -772,10 +808,11 @@ describe('run', () => {
       expect(formatReport(report)).toContain('Use --repos to check other repos.')
     })
 
-    it('with --repos alone, evaluates only those repos', async () => {
+    it('with --repos alone, still evaluates every repo, as applying on merge', async () => {
       const { report } = await dryRun(['--ignore-restricted-repos', '--repos', 'repo-a1'], { prFiles, suborgs })
 
-      expect(evaluatedRepos(report)).toEqual(['repo-a1'])
+      expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-a2', 'repo-b', 'repo-c1', 'repo-none', 'repo-team'])
+      expect(report.nextSyncRepos).toEqual([])
     })
   })
 })

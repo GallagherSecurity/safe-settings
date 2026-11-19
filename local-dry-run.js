@@ -20,7 +20,9 @@ Options:
   --deployment-config <path>   Deployment config file (default: DEPLOYMENT_CONFIG_FILE or
                                deployment-settings.yml in the current directory, if it exists)
   --ignore-restricted-repos    Evaluate repos even if restrictedRepos would skip them
-  --repos <a,b,...>            Only evaluate these repos (org-level settings still run)
+  --repos <a,b,...>            Also evaluate these repos. Those the PR doesn't cover are listed
+                               separately, as changes at their next sync, unless the PR changes
+                               the global settings file
   --only-changed               When the PR changes the global settings file, only evaluate
                                org-level settings and the repos covered by the PR's changed
                                repo and suborg files, plus any --repos and --assume-repos,
@@ -209,7 +211,7 @@ function createLocalSettingsClass (Settings, options) {
 
     async updateRepos (repo) {
       if (this.skipRepo?.(repo.repo)) {
-        this.log.debug(`Skipping ${repo.repo}, filtered out by --repos or --only-changed`)
+        this.log.debug(`Skipping ${repo.repo}, not covered by the PR (--only-changed)`)
         return
       }
       // Note which repos have their settings read, for checkAdminAccess(). On a suborg change
@@ -235,6 +237,17 @@ function createLocalSettingsClass (Settings, options) {
         }
       }
       return super.appendToResults(res)
+    }
+
+    // The base class records errors under its own class name and this.repo, which is the admin
+    // repo or whichever repo the run last set. Label one with the repo being processed, if there
+    // is one; otherwise it's about the run as a whole.
+    logError (msg) {
+      super.logError(msg)
+      const error = this.errors[this.errors.length - 1]
+      const repoName = currentRepo.getStore()
+      error.plugin = repoName ? 'Settings' : 'dry run'
+      error.repo = repoName ?? null
     }
 
     // Results are reported by the CLI instead of being posted to the pull request.
@@ -523,19 +536,19 @@ async function run (options, { token, Octokit, log } = {}) {
     }
   }
 
-  // Assumed repos are always evaluated, even when --repos doesn't list them. On a full sync with
-  // --only-changed, so are repos leaving a changed suborg: the full sync applies to them too.
+  // --repos and --assume-repos add repos to those the PR covers. On a full sync with
+  // --only-changed, which evaluates only the repos the PR covers, they're kept, and so are repos
+  // leaving a changed suborg: the full sync applies to them too.
   const listedRepos = new Set([...(options.repos || []), ...(options.assumeRepos || [])])
   if (fullSync && options.onlyChanged) {
     leavingRepos.forEach(l => listedRepos.add(l.repo))
   }
   const onlyChanged = fullSync && options.onlyChanged
-  settings.skipRepo = repoName => {
-    if (onlyChanged) {
-      return !listedRepos.has(repoName) && !changedRepoGlobs.some(glob => glob.test(repoName))
-    }
-    return options.repos !== undefined && !listedRepos.has(repoName)
-  }
+  settings.skipRepo = repoName => onlyChanged && !listedRepos.has(repoName) && !changedRepoGlobs.some(glob => glob.test(repoName))
+
+  // Repos evaluated for their next sync rather than the merge, and why: 'leaving' a changed
+  // suborg, or 'listed' with --repos but not covered by the PR
+  const nextSyncRepos = []
 
   // Results that apply at the next sync of their repo rather than when the PR merges
   const deferredResults = new Set()
@@ -581,20 +594,29 @@ async function run (options, { token, Octokit, log } = {}) {
         await settings.loadConfigs()
         await settings.updateAll()
       }
-      // The app doesn't sync repos that leave a suborg when the PR merges, only its members
-      // after the change. The next sync of each repo applies the new config to them, so
-      // evaluate them with every suborg's config and mark their results as applying later.
-      const later = leavingRepos.filter(l => !settings.evaluatedRepos.has(l.repo) && !settings.isRestricted(l.repo))
-      if (later.length > 0) {
+      // The app only syncs the repos the PR covers when it merges. Repos leaving a suborg, and
+      // --repos the PR doesn't cover, get the new config at their next sync. Evaluate them with
+      // every suborg's config and mark their results as applying then.
+      const archived = new Set((await settings.listOrgRepositories()).filter(r => r.archived).map(r => r.name))
+      const notYetEvaluated = repo => !settings.evaluatedRepos.has(repo) && !settings.isRestricted(repo) && !archived.has(repo)
+      for (const leaving of leavingRepos.filter(l => notYetEvaluated(l.repo))) {
+        leaving.later = true
+        nextSyncRepos.push({ repo: leaving.repo, reason: 'leaving' })
+      }
+      for (const repo of (options.repos || []).filter(notYetEvaluated)) {
+        if (!nextSyncRepos.some(r => r.repo === repo)) {
+          nextSyncRepos.push({ repo, reason: 'listed' })
+        }
+      }
+      if (nextSyncRepos.length > 0) {
         settings.subOrgConfigMap = undefined
         settings.suborgChange = false
         await settings.loadConfigs()
         const start = settings.results.length
-        for (const { repo } of later) {
+        for (const { repo } of nextSyncRepos) {
           await settings.updateRepos({ owner: options.org, repo })
         }
         settings.results.slice(start).forEach(result => deferredResults.add(result))
-        later.forEach(l => { l.later = true })
       }
     }
   } catch (error) {
@@ -648,6 +670,7 @@ async function run (options, { token, Octokit, log } = {}) {
       // A full sync applies to every repo; otherwise only if the run covered it for another reason
       appliesOnMerge: fullSync || (settings.evaluatedRepos.has(repo) && !later)
     })),
+    nextSyncRepos,
     ...adminAccess,
     results,
     errors: settings.errors,
@@ -762,7 +785,7 @@ function formatReport (report) {
   const allChanges = report.results.filter(r => r.type !== 'ERROR' && hasChanges(r))
   const changes = allChanges.filter(r => !r.deferred)
   const laterChanges = allChanges.filter(r => r.deferred)
-  const laterRepos = (report.leavingRepos || []).filter(l => l.evaluated && !l.appliesOnMerge).map(l => l.repo)
+  const laterRepos = report.nextSyncRepos || []
   const errors = report.results.filter(r => r.type === 'ERROR')
 
   lines.push(...formatBaseComparison(report.baseComparison))
@@ -796,7 +819,8 @@ function formatReport (report) {
     lines.push(...formatChange(r))
   }
   if (laterRepos.length > 0) {
-    lines.push('', `Repos leaving a changed suborg: ${laterRepos.join(', ')}`,
+    const why = { leaving: 'leaving a changed suborg', listed: 'from --repos' }
+    lines.push('', `Repos not covered by this PR: ${laterRepos.map(r => `${r.repo} (${why[r.reason]})`).join(', ')}`,
       'Safe Settings doesn\'t sync these when this PR merges. These changes apply the next time it',
       'syncs each repo:')
     if (laterChanges.length === 0) {
@@ -822,7 +846,7 @@ function formatReport (report) {
       lines.push(`  ${r.plugin} / ${r.repo}: ${r.action?.msg ?? formatValue(r.action)}`)
     }
     for (const e of report.errors) {
-      lines.push(`  ${e.plugin} / ${e.repo}: ${e.msg}`)
+      lines.push(`  ${e.plugin}${e.repo ? ` / ${e.repo}` : ''}: ${e.msg}`)
     }
   }
   lines.push('', `${report.apiRequests} API requests made.`)
