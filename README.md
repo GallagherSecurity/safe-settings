@@ -438,6 +438,35 @@ Here is a screenshot of what the users will see in the `checkrun` page:
 <img width="462" alt="image" src="https://github.com/github/safe-settings/assets/57544838/c875224f-894b-45da-a9cc-4bfc75c47670">
 </p>
 
+#### Running the dry run locally
+`local-dry-run.js` runs the same **nop** dry run for a pull request on the `admin` repo from your own machine, using your own token instead of the GitHub App. It lists repos through the organization API rather than the app installation, so it can also show what the settings would do to repos the app isn't installed on yet.
+
+```sh
+npm ci
+GITHUB_TOKEN=$(gh auth token) npm run dry-run -- --org my-org --pr 123
+```
+
+- **Input is a pull request.** The changed files and the branch are read from the PR, and config files are read from GitHub at the branch's latest commit, so push your changes first. The `--json` output includes that commit as `sha`. Only open PRs are checked: a merged PR's changes have already been applied to the repositories the app can access. PRs from forks aren't supported.
+- **Mostly the same decisions as the app.** If the PR changes `settings.yml`, every repo is evaluated, as the app does (use `--only-changed` to limit this); otherwise only the repos covered by the changed repo and suborg files. One difference: the app only reads the first 30 files a PR changes, while this reads them all. On a PR that changes more than 30 files, the app can miss `settings.yml` or some repo and suborg files, and evaluate fewer repos than this does.
+- **A branch behind its base branch.** Config is read from the branch, as the app's own PR check does, so commits on the base branch since the branch was made aren't included. If those commits change config files, the report warns you to update the branch. The `--json` output has the comparison as `baseComparison`.
+- **Repos leaving a suborg are evaluated too.** When the PR removes repos from a suborg (or deletes the suborg file), the app doesn't sync them on merge, only the suborg's members after the change. The next time the app syncs those repos, they lose the suborg's settings. The dry run compares suborg membership at the commit the PR's branch was made from and at its head, and evaluates the repos that leave. Their changes are listed separately, as applying at their next sync. In the `--json` output they're listed in `leavingRepos`, and their results have `deferred: true`. Custom property values are read as they are now at both commits, so only the PR's own changes to suborg files count.
+- **It never writes.** Any request other than a `GET` is blocked and reported as an error.
+- **Token permissions.** Reading branch protection, rulesets and collaborators needs admin access to each repo; org rulesets need org admin. Without admin on a repo, GitHub hides some of its settings, which can show up as changes that aren't real. The report warns about evaluated repos the token lacks admin on, and the `--json` output lists them as `reposWithoutAdmin` (and as `reposAdminUnknown` when GitHub doesn't return the token's permissions).
+- **Deployment config.** Pass `--deployment-config <path>` to apply `restrictedRepos`, `configvalidators` and `overridevalidators` from a deployment settings file. Without it, the file is found as the app finds it: `DEPLOYMENT_CONFIG_FILE`, or `deployment-settings.yml` in the current directory, if there is one. With no file, or a file that doesn't set `restrictedRepos`, the app's default `restrictedRepos` is used.
+
+Useful options (run with `--help` for all of them):
+
+| Option | Effect |
+|---|---|
+| `--ignore-restricted-repos` | Evaluate repos even if `restrictedRepos` would skip them |
+| `--repos repo-a,repo-b` | Only evaluate these repos (org-level settings still run). A name that isn't in the org stops the run with an error |
+| `--only-changed` | When the PR changes `settings.yml`, only evaluate org-level settings and the repos covered by the PR's changed repo and suborg files (plus `--repos` and `--assume-repos`), instead of every repo |
+| `--skip-org-settings` | Don't evaluate org-level settings (org rulesets). Use it if the token can't read org rulesets, which needs organization owner |
+| `--assume-suborg my-suborg --assume-repos repo-a,repo-b` | Treat the repos as matching the `suborgproperties` of `suborgs/my-suborg.yml` (and no other suborg's), as if their custom property values had already been changed. Conflicts with other suborgs are reported as they would be after the change |
+| `--json` | Print the raw results as JSON |
+
+The report starts with a warning if the token lacks admin on any evaluated repo. Then it lists the membership of each suborg the PR changes (and of `--assume-suborg`): how each repo matched, repos that end up in a different suborg, repos that leave it with this PR, and `suborgrepos` entries that match no repo. Then it lists the changes per plugin and repo, and any errors. The exit code is `0` on success, `1` if there were errors and `2` for invalid options.
+
 ### Error handling
 The app creates a `Check` at the end of its processing to indicate if there were any errors. The `Check` is called `safe-settings` and corresponds to the latest commit on the `default` branch of the `admin` repo.
 
