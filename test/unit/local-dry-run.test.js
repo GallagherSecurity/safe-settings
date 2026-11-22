@@ -7,9 +7,11 @@ const {
   getChangedConfigs,
   createOctokit,
   createLogger,
+  dedupeResults,
   formatReport
 } = require('../../local-dry-run')
 const Settings = require('../../lib/settings')
+const NopCommand = require('../../lib/nopcommand')
 
 const ORG = 'my-org'
 const BRANCH = 'my-branch'
@@ -64,10 +66,11 @@ function createFakeOctokitClass ({
   prFiles, suborgs, baseSuborgs = suborgs, suborgsByRef = {}, calls, pullRequest = {}, refs = [BRANCH, HEAD_SHA], settingsYml = SETTINGS_YML,
   contentRefs = new Set(), withoutAdmin = [], permissions = true, forbiddenRepos = [],
   comparison = { ahead_by: 0, files: [], merge_base_commit: { sha: BASE_SHA } },
-  failOnce = []
+  failOnce = [], branchProtection = {}
 }) {
   // Paths in `failOnce` fail with a 502 the first time they're requested, as a transient error would
   const failed = new Set()
+  let pullRequestReads = 0
   const suborgsAt = ref => suborgsByRef[ref] ?? (ref === BASE_SHA ? baseSuborgs : suborgs)
   const filesAt = ref => ({
     '.github/settings.yml': settingsYml,
@@ -83,7 +86,9 @@ function createFakeOctokitClass ({
     let match
     if ((match = pathname.match(/^\/repos\/my-org\/admin\/pulls\/1$/))) {
       const repo = { full_name: `${ORG}/admin` }
-      return { state: 'open', head: { ref: BRANCH, sha: HEAD_SHA, repo }, base: { ref: 'main', sha: BASE_SHA, repo }, ...pullRequest }
+      // An array gives the PR as each request in turn sees it, the last one repeating
+      const fields = Array.isArray(pullRequest) ? pullRequest[Math.min(pullRequestReads++, pullRequest.length - 1)] : pullRequest
+      return { state: 'open', head: { ref: BRANCH, sha: HEAD_SHA, repo }, base: { ref: 'main', sha: BASE_SHA, repo }, ...fields }
     }
     if (pathname === `/repos/my-org/admin/compare/${HEAD_SHA}...${BASE_SHA}`) {
       if (comparison instanceof Error) {
@@ -115,7 +120,9 @@ function createFakeOctokitClass ({
         calls.push(`404 ${pathname}`)
         throw new HttpError(404, 'Not Found')
       }
-      return { content: Buffer.from(yaml.dump(files[filePath])).toString('base64') }
+      // A string is the file's raw text, such as YAML that doesn't parse
+      const text = typeof files[filePath] === 'string' ? files[filePath] : yaml.dump(files[filePath])
+      return { content: Buffer.from(text).toString('base64') }
     }
     if (pathname === '/orgs/my-org/rulesets') {
       return []
@@ -144,6 +151,14 @@ function createFakeOctokitClass ({
         throw new HttpError(404, 'Not Found')
       }
       return { name: repo.name, archived: !!repo.archived }
+    }
+    // `branchProtection` maps 'repo/branch' to its current protection; other branches have none
+    if ((match = pathname.match(/^\/repos\/my-org\/([^/]+)\/branches\/([^/]+)\/protection$/))) {
+      const protection = branchProtection[`${match[1]}/${match[2]}`]
+      if (!protection) {
+        throw new HttpError(404, 'Branch not protected')
+      }
+      return protection
     }
     if (pathname.match(/^\/repos\/my-org\/[^/]+\/labels$/)) {
       return []
@@ -179,7 +194,9 @@ function createFakeOctokitClass ({
         repos: {
           get: route('GET', '/repos/{owner}/{repo}'),
           getCommit: route('GET', '/repos/{owner}/{repo}/commits/{ref}'),
-          getContent: route('GET', '/repos/{owner}/{repo}/contents/{path}')
+          getContent: route('GET', '/repos/{owner}/{repo}/contents/{path}'),
+          getBranchProtection: route('GET', '/repos/{owner}/{repo}/branches/{branch}/protection'),
+          updateBranchProtection: route('PUT', '/repos/{owner}/{repo}/branches/{branch}/protection')
         },
         git: { getTree: route('GET', '/repos/{owner}/{repo}/git/trees/{tree_sha}') },
         issues: {
@@ -218,10 +235,10 @@ const silentLog = { debug: () => {}, info: () => {}, warn: () => {}, error: () =
 
 // With `isolated`, runs with a fresh copy of the dry run and Safe Settings' modules, so that
 // lib/env and lib/deploymentConfig load again and pick up --admin-repo or --deployment-config.
-async function dryRun (args, { prFiles, suborgs = SUBORGS, baseSuborgs, suborgsByRef, comparison, failOnce, pullRequest, refs, settingsYml, withoutAdmin, permissions, forbiddenRepos, isolated = false } = {}) {
+async function dryRun (args, { prFiles, suborgs = SUBORGS, baseSuborgs, suborgsByRef, comparison, failOnce, branchProtection, pullRequest, refs, settingsYml, withoutAdmin, permissions, forbiddenRepos, isolated = false } = {}) {
   const calls = []
   const contentRefs = new Set()
-  const Octokit = createFakeOctokitClass({ prFiles, suborgs, baseSuborgs, suborgsByRef, comparison, failOnce, calls, pullRequest, refs, settingsYml, contentRefs, withoutAdmin, permissions, forbiddenRepos })
+  const Octokit = createFakeOctokitClass({ prFiles, suborgs, baseSuborgs, suborgsByRef, comparison, failOnce, branchProtection, calls, pullRequest, refs, settingsYml, contentRefs, withoutAdmin, permissions, forbiddenRepos })
   const options = parseCliArgs(['--org', ORG, '--pr', '1', ...args])
   const runOptions = { token: 'fake', Octokit, log: silentLog }
   let running
@@ -297,6 +314,38 @@ describe('withDefaultRestrictedRepos', () => {
   it("uses the file's restrictedRepos when it sets them, including an empty list", () => {
     expect(withDefaultRestrictedRepos({ restrictedRepos: { include: ['repo-a1'] } }).restrictedRepos).toEqual({ include: ['repo-a1'] })
     expect(withDefaultRestrictedRepos({ restrictedRepos: [] }).restrictedRepos).toEqual([])
+  })
+})
+
+describe('dedupeResults', () => {
+  const repo = { owner: ORG, repo: 'repo-b' }
+  const diff = (msg, additions) => ({ msg, additions, modifications: {}, deletions: {} })
+
+  it('keeps different changes from the same plugin and repo', () => {
+    // As the Repository plugin reports them: its other settings, then its topics
+    const settings = new NopCommand('Repository', repo, null, diff('Repository settings changes', { has_wiki: false }))
+    const topics = new NopCommand('Repository', repo, null, diff('Repository settings changes for topics', { entries: ['my-topic'] }))
+    // As the Branches plugin reports them: one diff per branch
+    const main = new NopCommand('Branches', repo, null, diff('Followings changes will be applied to the branch protection for main branch', { required_linear_history: true }))
+    const release = new NopCommand('Branches', repo, null, diff('Followings changes will be applied to the branch protection for release branch', { required_linear_history: true }))
+
+    expect(dedupeResults([settings, topics, main, release])).toEqual([settings, topics, main, release])
+  })
+
+  it('drops identical results, such as a plugin\'s results returned once per branch', () => {
+    const main = new NopCommand('Branches', repo, null, diff('Followings changes will be applied to the branch protection for main branch', { required_linear_history: true }))
+    const add = new NopCommand('Branches', repo, { url: '/repos/my-org/repo-b/branches/main/protection', body: { branch: 'main' } }, 'Add Branch Protection')
+    const copy = new NopCommand('Branches', repo, null, diff('Followings changes will be applied to the branch protection for main branch', { required_linear_history: true }))
+
+    expect(dedupeResults([main, add, main, add, copy])).toEqual([main, add])
+  })
+
+  it('keeps errors with different messages, and the same change for different repos', () => {
+    const error = msg => new NopCommand('Branches', repo, null, msg, 'ERROR')
+    const forRepo = name => new NopCommand('Labels', { owner: ORG, repo: name }, null, diff('Changes', { name: 'org-label' }))
+
+    expect(dedupeResults([error('one'), error('two'), error('one')])).toEqual([error('one'), error('two')])
+    expect(dedupeResults([forRepo('repo-a1'), forRepo('repo-a2')])).toHaveLength(2)
   })
 })
 
@@ -487,6 +536,45 @@ describe('run', () => {
       expect(calls.filter(c => c.startsWith('404 '))).toEqual([])
     })
 
+    describe('when a suborg file is renamed', () => {
+      const withoutB = Object.fromEntries(Object.entries(baseSuborgs).filter(([name]) => name !== 'suborg-b.yml'))
+      const renamed = (filename = '.github/suborgs/suborg-renamed.yml') => [{ filename, previous_filename: '.github/suborgs/suborg-b.yml', status: 'renamed' }]
+      const RENAMED = '.github/suborgs/suborg-renamed.yml'
+
+      it('shows its members moving to the new file, applying on merge', async () => {
+        const { report, calls } = await dryRun([], { prFiles: renamed(), suborgs: { ...withoutB, 'suborg-renamed.yml': baseSuborgs['suborg-b.yml'] }, baseSuborgs })
+
+        expect(report.leavingRepos).toEqual([
+          { repo: 'repo-b', from: '.github/suborgs/suborg-b.yml', to: RENAMED, evaluated: true, appliesOnMerge: true },
+          { repo: 'repo-none', from: '.github/suborgs/suborg-b.yml', to: RENAMED, evaluated: true, appliesOnMerge: true }
+        ])
+        expect(membership(report, 'suborg-b.yml')).toEqual(expect.objectContaining({ deleted: true }))
+        expect(evaluatedRepos(report)).toEqual(['repo-b', 'repo-none'])
+        expect(report.results.some(r => r.deferred)).toBe(false)
+        // The old path isn't read at the head commit
+        expect(calls.filter(c => c.startsWith('404 '))).toEqual([])
+      })
+
+      it('treats a member the new file drops as leaving, at its next sync', async () => {
+        const { report } = await dryRun([], { prFiles: renamed(), suborgs: { ...withoutB, 'suborg-renamed.yml': { suborgrepos: ['repo-b'] } }, baseSuborgs })
+
+        expect(report.leavingRepos).toEqual([
+          expect.objectContaining({ repo: 'repo-b', to: RENAMED, appliesOnMerge: true }),
+          expect.objectContaining({ repo: 'repo-none', to: null, appliesOnMerge: false })
+        ])
+        expect(leavingResults(report).length).toBeGreaterThan(0)
+        expect(leavingResults(report).every(r => r.deferred)).toBe(true)
+      })
+
+      it('treats a file moved out of the suborgs folder as deleted', async () => {
+        const { report } = await dryRun([], { prFiles: renamed('.github/old-suborgs/suborg-b.yml'), suborgs: withoutB, baseSuborgs })
+
+        expect(report.mode).toBe('selected')
+        expect(report.leavingRepos.map(l => [l.repo, l.to, l.appliesOnMerge])).toEqual([['repo-b', null, false], ['repo-none', null, false]])
+        expect(report.results.filter(r => r.repo === 'repo-b').every(r => r.deferred)).toBe(true)
+      })
+    })
+
     it('on a full sync with --only-changed, evaluates them as applying on merge', async () => {
       const { report } = await dryRun(['--only-changed'], { prFiles: ['.github/settings.yml', '.github/suborgs/suborg-b.yml'], suborgs, baseSuborgs })
 
@@ -612,6 +700,108 @@ describe('run', () => {
     })
   })
 
+  describe('when a suborg file can\'t be read', () => {
+    it('stops with the error when a changed suborg file doesn\'t parse', async () => {
+      // suborg-a.yml is read before it, so the base class would carry on with suborg-a alone
+      const suborgs = { ...SUBORGS_WITHOUT_GLOB, 'suborg-b.yml': 'suborgrepos: [repo-b\n' }
+      const { report } = await dryRun([], { prFiles: ['.github/suborgs/suborg-b.yml'], suborgs, baseSuborgs: SUBORGS_WITHOUT_GLOB })
+
+      expect(errorMessages(report)).toEqual([
+        expect.stringContaining('YAMLException'),
+        expect.stringContaining('Stopped: suborg membership could not be resolved')
+      ])
+      // Not repo-b wrongly leaving suborg-b, nor suborg-a's repos evaluated as if the PR changed it
+      expect(report.leavingRepos).toEqual([])
+      expect(evaluatedRepos(report)).toEqual([])
+      expect(report.suborgMembership).toEqual([])
+    })
+
+    it('reports an error, rather than none leaving, when one read for membership at the head fails', async () => {
+      // The first read of suborg-b.yml is the head membership check's; the run's own succeeds
+      const prFiles = ['.github/suborgs/suborg-a.yml']
+      const { report } = await dryRun([], { prFiles, suborgs: SUBORGS_WITHOUT_GLOB, failOnce: ['/repos/my-org/admin/contents/.github/suborgs/suborg-b.yml'] })
+
+      expect(errorMessages(report)).toEqual([
+        expect.stringMatching(/^Couldn't work out which repos leave the changed suborgs: suborg membership at the head commit couldn't be resolved: .*Bad Gateway/)
+      ])
+      expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-a2'])
+    })
+  })
+
+  describe('branch protection', () => {
+    const settingsYml = {
+      ...SETTINGS_YML,
+      branches: [
+        { name: 'main', protection: { required_linear_history: true } },
+        { name: 'release', protection: { required_linear_history: true } }
+      ]
+    }
+    const prFiles = ['.github/suborgs/suborg-b.yml']
+    const branchResults = report => report.results.filter(r => r.plugin === 'Branches' && r.repo === 'repo-b')
+    const shown = report => branchResults(report).filter(r => r.action?.additions !== null)
+
+    it('reports protection for a branch that has none as a change', async () => {
+      const { report } = await dryRun([], { prFiles, suborgs: SUBORGS_WITHOUT_GLOB, settingsYml })
+
+      const added = branch => ({
+        msg: `Branch protection will be added to the ${branch} branch, which has none`,
+        additions: { branches: [{ name: branch, protection: expect.objectContaining({ required_linear_history: true }) }] },
+        modifications: {},
+        deletions: {}
+      })
+      expect(shown(report).map(r => r.action)).toEqual(expect.arrayContaining([added('main'), added('release')]))
+      expect(shown(report)).toHaveLength(2)
+      // Only the protection settings, not the request's own parameters
+      const protection = shown(report)[0].action.additions.branches[0].protection
+      expect(['owner', 'repo', 'branch', 'headers'].filter(key => key in protection)).toEqual([])
+      const text = formatReport(report)
+      expect(text).toContain('== Branches / repo-b')
+      expect(text).toContain('required_linear_history')
+    })
+
+    it('leaves the request that follows a change to existing protection as it is', async () => {
+      const branchProtection = { 'repo-b/release': { required_linear_history: { enabled: false } } }
+      const { report } = await dryRun([], { prFiles, suborgs: SUBORGS_WITHOUT_GLOB, settingsYml, branchProtection })
+
+      // main has none, so it's added; release has some, so the plugin's own diff shows the change
+      const messages = shown(report).map(r => r.action.msg)
+      expect(messages).toHaveLength(2)
+      expect(messages).toEqual(expect.arrayContaining([
+        'Branch protection will be added to the main branch, which has none',
+        expect.stringContaining('Followings changes will be applied to the branch protection')
+      ]))
+      expect(branchResults(report).filter(r => r.action.msg === 'Add Branch Protection')).toHaveLength(1)
+    })
+  })
+
+  it('never runs validator scripts from the PR\'s settings.yml', async () => {
+    const script = plugin => `globalThis.prValidatorsRun = [...(globalThis.prValidatorsRun || []), '${plugin}']; return true`
+    const settingsYml = {
+      ...SETTINGS_YML,
+      repository: { topics: ['org-topic'] },
+      configvalidators: [{ plugin: 'repository', error: 'config', script: script('config') }],
+      overridevalidators: [{ plugin: 'repository', error: 'override', script: script('override') }]
+    }
+    const suborgs = { ...SUBORGS_WITHOUT_GLOB, 'suborg-a.yml': { suborgproperties: [{ suborg: 'a' }], repository: { topics: ['suborg-topic'] } } }
+    delete globalThis.prValidatorsRun
+    try {
+      const { report } = await dryRun([], { prFiles: ['.github/suborgs/suborg-a.yml'], suborgs, settingsYml })
+
+      expect(globalThis.prValidatorsRun).toBeUndefined()
+      expect(evaluatedRepos(report)).toEqual(['repo-a1', 'repo-a2'])
+    } finally {
+      delete globalThis.prValidatorsRun
+    }
+  })
+
+  it.each([
+    ['head', { head: { ref: BRANCH, sha: 'f'.repeat(40), repo: { full_name: `${ORG}/admin` } } }],
+    ['base', { base: { ref: 'main', sha: 'e'.repeat(40), repo: { full_name: `${ORG}/admin` } } }]
+  ])('stops when the PR\'s %s moves while its files are listed', async (_label, moved) => {
+    await expect(dryRun([], { prFiles: ['.github/suborgs/suborg-a.yml'], pullRequest: [{}, moved] }))
+      .rejects.toThrow('PR #1 changed while the dry run was starting')
+  })
+
   it('stops with a clear error when the ref can\'t be read', async () => {
     await expect(dryRun([], { prFiles: ['.github/suborgs/suborg-a.yml'], refs: [] }))
       .rejects.toThrow(`Couldn't read ${BRANCH} (${HEAD_SHA}) in ${ORG}/admin (422). Check the branch still exists`)
@@ -665,6 +855,23 @@ describe('run', () => {
 
       expect(report.nextSyncRepos).toEqual([])
     })
+  })
+
+  it('evaluates --repos for their next sync when the PR changes no config', async () => {
+    const settingsYml = { ...SETTINGS_YML, rulesets: [{ name: 'org-ruleset', target: 'branch', enforcement: 'active' }] }
+    const { report } = await dryRun(['--repos', 'repo-b'], { prFiles: ['README.md'], settingsYml })
+
+    expect(report.mode).toBe('none')
+    expect(report.nextSyncRepos).toEqual([{ repo: 'repo-b', reason: 'listed' }])
+    expect(evaluatedRepos(report)).toEqual(['repo-b'])
+    expect(report.results.length).toBeGreaterThan(0)
+    expect(report.results.every(r => r.deferred && r.repo === 'repo-b')).toBe(true)
+    // Merging this PR syncs nothing, org-level settings included
+    expect(report.results.some(r => r.scope === 'org')).toBe(false)
+
+    const text = formatReport(report)
+    expect(text).toContain('No Safe Settings changes detected in this PR.')
+    expect(text).toContain('Repos not covered by this PR: repo-b (from --repos)')
   })
 
   it('rejects --repos that are not in the org, rather than reporting no changes', async () => {

@@ -181,14 +181,19 @@ function createLocalSettingsClass (Settings, options) {
       return super.isRestricted(repoName)
     }
 
-    // In nop mode, when getSubOrgConfigs() fails (such as a repo claimed by two suborgs), the
-    // base class records an error result and returns undefined. updateRepos() caches the
-    // lookup only when it succeeds, so it would run it again for every repo. Stop instead:
-    // without suborg membership every later result would be misleading.
+    // In nop mode, getSubOrgConfigs() doesn't throw when it fails; it records an error result.
+    // When a repo is claimed by two suborgs it returns undefined, and updateRepos() would run
+    // the lookup again for every repo. When a suborg file can't be read or parsed, it returns
+    // the suborgs read before that file, without the changed-suborg filter. Stop in both cases:
+    // without full suborg membership every later result would be misleading.
     async getSubOrgConfigs () {
+      const countErrors = () => this.results.filter(r => r.type === 'ERROR').length
+      const errorsBefore = countErrors()
       const subOrgConfigs = await super.getSubOrgConfigs()
-      if (subOrgConfigs === undefined) {
-        throw new Error('Stopped: suborg membership could not be resolved (see the getSubOrgConfigs error)')
+      if (subOrgConfigs === undefined || countErrors() > errorsBefore) {
+        // For run() to tell that the run's own lookup failed
+        this.membershipUnresolved = true
+        throw new Error('Stopped: suborg membership could not be resolved (see the error before this one)')
       }
       return subOrgConfigs
     }
@@ -466,13 +471,27 @@ async function run (options, { token, Octokit, log } = {}) {
     throw new Error(`Couldn't read ${ref} (${sha}) in ${options.org}/${adminRepo} (${error.status || error.message}). Check the branch still exists and the token can read that repository's contents.`)
   }
   const prFiles = await octokit.paginate(octokit.rest.pulls.listFiles, context.repo({ pull_number: options.pr, per_page: 100 }))
+  // listFiles gives the PR's current diff, not the diff at sha. Check the PR hasn't moved since
+  // pulls.get, so the files that decide which repos to evaluate match the config being read.
+  const { data: pullRequestAfterFiles } = await octokit.rest.pulls.get(context.repo({ pull_number: options.pr }))
+  if (pullRequestAfterFiles.head.sha !== sha || pullRequestAfterFiles.base.sha !== pullRequest.base.sha) {
+    throw new Error(`PR #${options.pr} changed while the dry run was starting (a push to it or its base branch). Run it again.`)
+  }
   const files = prFiles.map(f => f.filename)
-  const removedFiles = new Set(prFiles.filter(f => f.status === 'removed').map(f => f.filename))
+  // A renamed file is gone from its old path, so treat that path as removed. The app syncs
+  // only the new path on merge, as a push lists a rename as one file removed and one added.
+  const renamedFrom = prFiles.filter(f => f.status === 'renamed' && f.previous_filename).map(f => f.previous_filename)
+  const removedFiles = new Set([...prFiles.filter(f => f.status === 'removed').map(f => f.filename), ...renamedFrom])
   const baseComparison = await compareWithBase(octokit, context, pullRequest, CONFIG_PATH, log)
 
   const deploymentConfig = withDefaultRestrictedRepos(DeploymentConfig.config)
   const runtimeConfig = await new ConfigManager(context, sha).loadGlobalSettingsYaml()
   const config = Object.assign({}, deploymentConfig, runtimeConfig)
+  // Settings runs validator scripts as JavaScript, and the PR's settings.yml would otherwise
+  // replace the deployment config's. Take them only from the local deployment config, so that
+  // checking someone else's PR never runs their code with your token.
+  config.configvalidators = deploymentConfig.configvalidators
+  config.overridevalidators = deploymentConfig.overridevalidators
 
   const LocalSettings = createLocalSettingsClass(Settings, options)
   const settings = new LocalSettings(true, context, context.repo(), config, sha)
@@ -506,7 +525,13 @@ async function run (options, { token, Octokit, log } = {}) {
 
   // Repos covered by the PR's changed repo and suborg files
   const changedRepos = new Set(repoChanges.map(r => r.repo))
-  const changedSubOrgPaths = new Set(subOrgChanges.map(s => s.path))
+  // Includes a renamed suborg file's old path, so its former members are checked for leaving.
+  // Not in subOrgChanges: the file isn't there at the head, and the app doesn't sync it.
+  const changedSubOrgPaths = new Set([
+    ...subOrgChanges.map(s => s.path),
+    ...renamedFrom.filter(file => Settings.SUB_ORG_PATTERN.test(file))
+  ])
+  const selectedSync = repoChanges.length > 0 || changedSubOrgPaths.size > 0
   let changedRepoGlobs = []
   let orgResults = []
 
@@ -518,7 +543,7 @@ async function run (options, { token, Octokit, log } = {}) {
   // Why membership at the head commit couldn't be resolved, if it couldn't. Reported after the run
   // unless the run hits a membership failure too (such as a suborg conflict) and reports that.
   let headMembershipError
-  if (subOrgChanges.length > 0) {
+  if (changedSubOrgPaths.size > 0) {
     try {
       membershipResolver.subOrgConfigs = await membershipResolver.getSubOrgConfigs()
     } catch (error) {
@@ -577,9 +602,12 @@ async function run (options, { token, Octokit, log } = {}) {
       // suborgrepos entries can be globs, so match with the same Glob class Settings uses
       changedRepoGlobs = [...changedRepos].map(pattern => new Glob(pattern))
       await settings.updateAll()
-    } else if (repoChanges.length > 0 || subOrgChanges.length > 0) {
-      // Same steps as Settings.syncSelectedRepos
-      await updateOrg()
+    } else if (selectedSync || options.repos) {
+      // Same steps as Settings.syncSelectedRepos. A PR that changes no config syncs nothing on
+      // merge, but --repos are still evaluated below, for their next sync.
+      if (selectedSync) {
+        await updateOrg()
+      }
       for (const repo of repoChanges) {
         settings.repo = repo
         await settings.loadConfigs(repo)
@@ -633,7 +661,7 @@ async function run (options, { token, Octokit, log } = {}) {
   // Skip the summary if membership already failed to resolve; the run reports why.
   const suborgPaths = [...new Set([...changedSubOrgPaths, ...(assumedSuborgPath ? [assumedSuborgPath] : [])])]
   let suborgMembership = []
-  const membershipFailed = settings.results.some(r => r.type === 'ERROR' && r.plugin === 'getSubOrgConfigs')
+  const membershipFailed = Boolean(settings.membershipUnresolved)
   if (headMembershipError && !membershipFailed) {
     settings.logError(`Couldn't work out which repos leave the changed suborgs: suborg membership at the head commit couldn't be resolved: ${headMembershipError}`)
   }
@@ -645,14 +673,15 @@ async function run (options, { token, Octokit, log } = {}) {
     }
   }
 
-  const results = dedupeResults(settings.results).map(result => {
+  const results = dedupeResults(settings.results).map((result, index, all) => {
     return Object.assign({}, result, {
       scope: orgResults.includes(result) ? 'org' : 'repo',
-      ...(deferredResults.has(result) && { deferred: true })
+      ...(deferredResults.has(result) && { deferred: true }),
+      ...(isNewBranchProtection(result, all[index - 1]) && { action: newBranchProtectionChange(result) })
     })
   })
 
-  const mode = fullSync ? 'full' : (repoChanges.length > 0 || subOrgChanges.length > 0) ? 'selected' : 'none'
+  const mode = fullSync ? 'full' : selectedSync ? 'selected' : 'none'
   return {
     pr: options.pr,
     ref,
@@ -678,12 +707,46 @@ async function run (options, { token, Octokit, log } = {}) {
   }
 }
 
-// Same de-duplication as Settings.handleResults, except that errors are only dropped when their
-// message is also the same: the app keeps one error per plugin and repo, which hides the rest.
+// Some plugins return the same array of results more than once (Branches returns it once per
+// branch), so results arrive duplicated. Settings.handleResults keeps only the first result per
+// type, plugin and repo, which also drops different results, such as Repository's topic changes
+// after its other changes, or every branch's protection changes after the first. Drop only
+// results that are identical.
 function dedupeResults (results) {
-  const sameResult = (a, b) => a.type === b.type && a.repo === b.repo && a.plugin === b.plugin &&
-    (a.type !== 'ERROR' || a.action?.msg === b.action?.msg)
-  return results.filter((thing, index, self) => index === self.findIndex(t => sameResult(t, thing)))
+  const seen = new Set()
+  return results.filter(result => {
+    const key = JSON.stringify([result.type, result.plugin, result.repo, result.endpoint, result.body, result.action])
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
+}
+
+// The Branches plugin reports changes to a branch's protection as a diff, followed straight away
+// by an "Add Branch Protection" action with the request. For a branch with no protection yet, it
+// reports only the action, which has no diff, so it would read as no change. Pick those out: an
+// "Add Branch Protection" that doesn't follow a Branches diff for the same repo.
+function isNewBranchProtection (result, previous) {
+  if (result.type !== 'INFO' || result.plugin !== 'Branches' || result.action?.msg !== 'Add Branch Protection' || !result.endpoint) {
+    return false
+  }
+  const followsDiff = previous && previous.plugin === 'Branches' && previous.repo === result.repo && hasChanges(previous)
+  return !followsDiff
+}
+
+// The request body as a diff, shaped like the branches config, as reports show only the diff
+function newBranchProtectionChange (result) {
+  const branch = decodeURIComponent(result.endpoint.match(/\/branches\/([^/]+)\/protection$/)?.[1] ?? '')
+  // The request's own parameters, in case the endpoint left them in the body
+  const { owner, repo, branch: _branch, headers, ...protection } = result.body || {}
+  return {
+    msg: `Branch protection will be added to the ${branch} branch, which has none`,
+    additions: { branches: [{ name: branch, protection }] },
+    modifications: {},
+    deletions: {}
+  }
 }
 
 function hasChanges (result) {
@@ -887,4 +950,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { main, run, parseCliArgs, withDefaultRestrictedRepos, getChangedConfigs, createOctokit, createLocalSettingsClass, createLogger, formatReport }
+module.exports = { main, run, parseCliArgs, withDefaultRestrictedRepos, getChangedConfigs, createOctokit, createLocalSettingsClass, createLogger, dedupeResults, formatReport }
