@@ -90,7 +90,8 @@ function createFakeOctokitClass ({
       const fields = Array.isArray(pullRequest) ? pullRequest[Math.min(pullRequestReads++, pullRequest.length - 1)] : pullRequest
       return { state: 'open', head: { ref: BRANCH, sha: HEAD_SHA, repo }, base: { ref: 'main', sha: BASE_SHA, repo }, ...fields }
     }
-    if (pathname === `/repos/my-org/admin/compare/${HEAD_SHA}...${BASE_SHA}`) {
+    // Only with the base branch by name: the PR's base.sha can be older than the branch
+    if (pathname === `/repos/my-org/admin/compare/${HEAD_SHA}...main`) {
       if (comparison instanceof Error) {
         throw comparison
       }
@@ -446,6 +447,16 @@ describe('run', () => {
 
       expect(report.baseComparison).toEqual(expect.objectContaining({ aheadBy: 2, mergeBase: MERGE_BASE_SHA, configFilesChanged: ['.github/suborgs/suborg-c.yml'] }))
       expect(formatReport(report)).toContain('Warning: the branch is 2 commit(s) behind main, and those commits change config files: .github/suborgs/suborg-c.yml.')
+    })
+
+    it('compares with the base branch\'s latest commit, not the PR\'s base.sha', async () => {
+      // GitHub only updates base.sha when the PR's branch is pushed, so it can predate commits
+      // made to main since, as it does here
+      const { report, calls } = await dryRun([], { prFiles, comparison: behind(['.github/repos/repo-b.yml']) })
+
+      expect(calls).toContain(`GET /repos/my-org/admin/compare/${HEAD_SHA}...main`)
+      expect(calls.filter(c => c.includes(`...${BASE_SHA}`))).toEqual([])
+      expect(formatReport(report)).toContain('Warning: the branch is 2 commit(s) behind main, and those commits change config files: .github/repos/repo-b.yml.')
     })
 
     it('only notes it when those commits change no config', async () => {

@@ -380,12 +380,14 @@ async function checkAdminAccess (settings) {
 // commits, and so do the results, as with the app's own PR check. Compares head...base, so
 // ahead_by counts the base branch's commits that the head doesn't have, and files lists what
 // they changed. GitHub lists at most 300 files.
+// Compares with the base branch by name: the PR's base.sha is the base branch as it was when the
+// PR's branch was last pushed, so it misses commits made to the base branch since.
 const MAX_COMPARE_FILES = 300
 async function compareWithBase (octokit, context, pullRequest, configPath, log) {
   const base = pullRequest.base.ref
   try {
     const { data } = await octokit.request('GET /repos/{owner}/{repo}/compare/{basehead}',
-      context.repo({ basehead: `${pullRequest.head.sha}...${pullRequest.base.sha}` }))
+      context.repo({ basehead: `${pullRequest.head.sha}...${base}` }))
     const changedFiles = (data.files || []).map(f => f.filename)
     return {
       base,
